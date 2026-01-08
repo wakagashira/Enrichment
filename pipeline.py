@@ -341,7 +341,8 @@ def run_pipeline(
 
     if df_results.empty:
         return
-
+    #ag source system
+    df_results["SourceSystem"] = source_system
     print(f"[{timestamp()}] Inserting results into ResultsBI...")
     inserted = insert_results(engine, df_results)
     print(f"[{timestamp()}] Inserted {inserted} rows into ResultsBI for {company_code}")
