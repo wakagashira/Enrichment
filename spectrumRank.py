@@ -1,37 +1,23 @@
-
-import pandas as pd
 from sqlalchemy import create_engine
-from pipeline import run_pipeline
-from config import DB_CONN_STRING
+from config import CONNECTION_STRING, MAX_DIST
+from pipeline import run_pipeline, load_all_company_codes
 from utils import timestamp
-
-def load_spectrum_customers(engine):
-    sql = '''
-        SELECT
-            Company_Code        AS CompanyCode,
-            Customer_Code       AS CustomerCode,
-            Name                AS CustomerName,
-            City,
-            State,
-            Zip_Code            AS Zip,
-            Phone,
-            Customer_Email      AS Email
-        FROM Spectrum.CR_CUSTOMER_MASTER_MC
-        WHERE Status = 'A'
-    '''
-    return pd.read_sql(sql, engine)
 
 def main():
     print(f"[{timestamp()}] Starting Spectrum ranking job")
-    engine = create_engine(DB_CONN_STRING)
-    df = load_spectrum_customers(engine)
 
-    run_pipeline(
-        engine=engine,
-        df_source=df,
-        source_system="SPECTRUM",
-        max_dist=6
-    )
+    engine = create_engine(CONNECTION_STRING)
+
+    company_codes = load_all_company_codes(engine)
+
+    for cc in company_codes:
+        print(f"[{timestamp()}] Processing company {cc}")
+        run_pipeline(
+            engine=engine,
+            company_code=cc,
+            max_dist=MAX_DIST,
+            source_system="SPECTRUM"
+        )
 
     print(f"[{timestamp()}] Spectrum ranking completed")
 
