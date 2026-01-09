@@ -4,7 +4,7 @@ from matcher import compute_distance, normalize
 from utils import timestamp
 
 ######################################################################
-# STATE NORMALIZATION (BI & SF STATE FIELDS → 2-CHAR CODES)
+# STATE NORMALIZATION
 ######################################################################
 
 US_STATE_MAP = {
@@ -21,43 +21,44 @@ US_STATE_MAP = {
     "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY"
 }
 
-
 def normalize_state(s: str) -> str:
     if not s:
         return ""
     s = s.strip()
-    if not s:
-        return ""
     if len(s) == 2:
         return s.upper()
     return US_STATE_MAP.get(s.lower(), "")
 
+######################################################################
+# NORMALIZATION HELPERS
+######################################################################
+
+def normalize_phone(p):
+    if not p:
+        return ""
+    digits = "".join(c for c in str(p) if c.isdigit())
+    return digits[-10:] if len(digits) >= 7 else ""
+
+def normalize_zip(z):
+    if not z:
+        return ""
+    digits = "".join(c for c in str(z) if c.isdigit())
+    return digits[:5] if len(digits) >= 5 else ""
+
+def email_domain(e):
+    if not e or "@" not in e:
+        return ""
+    return e.split("@", 1)[1].lower().strip()
 
 ######################################################################
-# ENGINE CREATOR
+# ENGINE
 ######################################################################
 
 def get_engine(conn_str: str):
     return create_engine(conn_str, fast_executemany=True)
 
-
 ######################################################################
-# LOAD ALL COMPANY CODES
-######################################################################
-
-def load_all_company_codes(engine):
-    query = """
-        SELECT DISTINCT Company_Code__c
-        FROM salesforce.creteProd.Partner__c
-        WHERE Company_Code__c IS NOT NULL
-        ORDER BY Company_Code__c;
-    """
-    df = pd.read_sql(text(query), engine)
-    return df["Company_Code__c"].dropna().tolist()
-
-
-######################################################################
-# LOAD SALESFORCE ACCOUNTS
+# LOADERS
 ######################################################################
 
 def load_sf_accounts(engine, company_code: str) -> pd.DataFrame:
@@ -66,10 +67,13 @@ def load_sf_accounts(engine, company_code: str) -> pd.DataFrame:
             a.Id,
             a.Name,
             a.Email__c,
+            a.Phone,
             a.BillingCity,
             a.BillingState,
+            a.BillingPostalCode,
             a.ShippingCity,
             a.ShippingState,
+            a.ShippingPostalCode,
             a.Spectrum_Customer_Code__c
         FROM salesforce.creteProd.Account a
         INNER JOIN salesforce.creteProd.Partner__c p
@@ -80,10 +84,6 @@ def load_sf_accounts(engine, company_code: str) -> pd.DataFrame:
     return pd.read_sql(text(query), engine, params={"cc": company_code})
 
 
-######################################################################
-# LOAD BI CUSTOMERS
-######################################################################
-
 def load_bi_customers(engine, company_code: str) -> pd.DataFrame:
     query = """
         SELECT
@@ -91,17 +91,15 @@ def load_bi_customers(engine, company_code: str) -> pd.DataFrame:
             Customer_Code AS CustomerNumber,
             Name,
             Customer_Email,
+            Phone,
             City,
-            State
+            State,
+            Zip
         FROM dbo.Master_Customer_From_BI
         WHERE Company_Code = :cc;
     """
     return pd.read_sql(text(query), engine, params={"cc": company_code})
 
-
-######################################################################
-# LOAD SPECTRUM CUSTOMERS (NEW)
-######################################################################
 
 def load_spectrum_customers(engine, company_code: str) -> pd.DataFrame:
     query = """
@@ -110,17 +108,18 @@ def load_spectrum_customers(engine, company_code: str) -> pd.DataFrame:
             Customer_Code AS CustomerNumber,
             Name,
             Customer_Email,
+            Phone,
             City,
-            State
+            State,
+            Zip_Code AS Zip
         FROM salesforce.Spectrum.CR_CUSTOMER_MASTER_MC
         WHERE Company_Code = :cc
           AND Status = 'A';
     """
     return pd.read_sql(text(query), engine, params={"cc": company_code})
 
-
 ######################################################################
-# BLOCK CANDIDATE PAIRS
+# BLOCKING
 ######################################################################
 
 def block_pairs(df_sf: pd.DataFrame, df_bi: pd.DataFrame) -> pd.DataFrame:
@@ -131,10 +130,13 @@ def block_pairs(df_sf: pd.DataFrame, df_bi: pd.DataFrame) -> pd.DataFrame:
         "Id": "AccountId",
         "Name": "SFName",
         "Email__c": "SFEmail",
+        "Phone": "SFPhone",
         "BillingCity": "SFBillingCity",
         "BillingState": "SFBillingState",
+        "BillingPostalCode": "SFBillingPostalCode",
         "ShippingCity": "SFShippingCity",
         "ShippingState": "SFShippingState",
+        "ShippingPostalCode": "SFShippingPostalCode",
         "Spectrum_Customer_Code__c": "SpectrumCode"
     })
 
@@ -143,8 +145,10 @@ def block_pairs(df_sf: pd.DataFrame, df_bi: pd.DataFrame) -> pd.DataFrame:
         "CustomerNumber": "CustomerNumber",
         "Name": "BIName",
         "Customer_Email": "BIEmail",
+        "Phone": "BIPhone",
         "City": "BICity",
-        "State": "BIState"
+        "State": "BIState",
+        "Zip": "BIZip"
     })
 
     df_sf["FirstChar"] = df_sf["SFName"].str[0].str.upper()
@@ -154,34 +158,38 @@ def block_pairs(df_sf: pd.DataFrame, df_bi: pd.DataFrame) -> pd.DataFrame:
     df_bi["NameLen_bi"] = df_bi["BIName"].str.len()
 
     merged = df_bi.merge(df_sf, on="FirstChar", how="inner")
-
-    merged = merged[
-        (merged["NameLen_bi"] - merged["NameLen_sf"]).abs() <= 3
-    ]
-
-    return merged
-
-
+    return merged[(merged["NameLen_bi"] - merged["NameLen_sf"]).abs() <= 3]
 ######################################################################
-# COMPUTE MATCHES (UNCHANGED)
+# LOAD ALL COMPANY CODES (USED WHEN COMPANY_CODE = ALL)
+######################################################################
+
+def load_all_company_codes(engine):
+    """
+    Load all distinct Company_Code__c values from Salesforce Partner__c.
+    Used by spectrumrank.py when COMPANY_CODE=ALL.
+    """
+    query = """
+        SELECT DISTINCT Company_Code__c
+        FROM salesforce.creteProd.Partner__c
+        WHERE Company_Code__c IS NOT NULL
+        ORDER BY Company_Code__c;
+    """
+    df = pd.read_sql(text(query), engine)
+    return df["Company_Code__c"].dropna().tolist()
+######################################################################
+# SCORING + BONUS + CONFIDENCE
 ######################################################################
 
 def compute_matches(df_pairs: pd.DataFrame, max_dist: int) -> pd.DataFrame:
     results = []
 
-    if df_pairs.empty:
-        return pd.DataFrame()
-
     for _, row in df_pairs.iterrows():
-        bi_name_raw = row["BIName"] or ""
-        sf_name_raw = row["SFName"] or ""
-
-        bi_norm = normalize(bi_name_raw)
-        sf_norm = normalize(sf_name_raw)
+        bi_norm = normalize(row["BIName"] or "")
+        sf_norm = normalize(row["SFName"] or "")
 
         min_len = min(len(bi_norm), len(sf_norm))
         if min_len == 0:
-            dist = max_dist + 1
+            continue
         elif min_len < 4:
             dist = 0 if bi_norm == sf_norm else max(4, max_dist)
         else:
@@ -190,39 +198,71 @@ def compute_matches(df_pairs: pd.DataFrame, max_dist: int) -> pd.DataFrame:
         if dist > max_dist:
             continue
 
-        bi_email = (row["BIEmail"] or "").strip().lower()
-        sf_email = (row["SFEmail"] or "").strip().lower()
-        email_score = -1 if bi_email and bi_email == sf_email else 0
+        # Email
+        email_score = 0
+        bi_email = (row["BIEmail"] or "").lower().strip()
+        sf_email = (row["SFEmail"] or "").lower().strip()
+        if bi_email and sf_email:
+            if bi_email == sf_email:
+                email_score = -1
+            elif email_domain(bi_email) == email_domain(sf_email):
+                email_score = -1
 
-        bi_city = (row["BICity"] or "").strip().lower()
-        sf_cities = [
-            (row.get("SFBillingCity") or "").strip().lower(),
-            (row.get("SFShippingCity") or "").strip().lower()
-        ]
-        sf_cities_clean = [c for c in sf_cities if c]
+        # Phone
+        phone_score = -2 if normalize_phone(row.get("BIPhone")) == normalize_phone(row.get("SFPhone")) and normalize_phone(row.get("BIPhone")) else 0
 
-        if not bi_city and not sf_cities_clean:
-            city_score = 0
-        elif bi_city and any(bi_city == c for c in sf_cities_clean):
+        # City
+        bi_city = (row.get("BICity") or "").lower().strip()
+        sf_cities = [(row.get("SFBillingCity") or "").lower().strip(),
+                     (row.get("SFShippingCity") or "").lower().strip()]
+        sf_cities = [c for c in sf_cities if c]
+
+        if bi_city and bi_city in sf_cities:
             city_score = -1
-        else:
+        elif bi_city and sf_cities:
             city_score = 1
-
-        bi_state = normalize_state((row["BIState"] or "").strip())
-        sf_states = [
-            normalize_state((row.get("SFBillingState") or "").strip()),
-            normalize_state((row.get("SFShippingState") or "").strip())
-        ]
-        sf_states_clean = [s for s in sf_states if s]
-
-        if not bi_state and not sf_states_clean:
-            state_score = 0
-        elif bi_state and any(bi_state == s for s in sf_states_clean):
-            state_score = -1
         else:
-            state_score = 1
+            city_score = 0
 
-        total_score = dist + email_score + city_score + state_score
+        # ZIP
+        zip_score = -1 if normalize_zip(row.get("BIZip")) in [
+            normalize_zip(row.get("SFBillingPostalCode")),
+            normalize_zip(row.get("SFShippingPostalCode"))
+        ] and normalize_zip(row.get("BIZip")) else 0
+
+        # State
+        bi_state = normalize_state(row.get("BIState"))
+        sf_states = [normalize_state(row.get("SFBillingState")),
+                     normalize_state(row.get("SFShippingState"))]
+        sf_states = [s for s in sf_states if s]
+
+        if bi_state and bi_state in sf_states:
+            state_score = -1
+        elif bi_state and sf_states:
+            state_score = 1
+        else:
+            state_score = 0
+
+        # Multi-signal bonus
+        strong_signals = sum([
+            dist <= 1,
+            email_score < 0,
+            phone_score < 0,
+            zip_score < 0,
+            city_score < 0,
+            state_score < 0
+        ])
+        multi_signal_bonus = -1 if strong_signals >= 3 else 0
+
+        total_score = dist + email_score + phone_score + zip_score + city_score + state_score + multi_signal_bonus
+
+        # Confidence band
+        if total_score <= 0:
+            confidence = "HIGH"
+        elif total_score <= 2:
+            confidence = "MEDIUM"
+        else:
+            confidence = "LOW"
 
         results.append({
             "CompanyCode": row["CompanyCode"],
@@ -230,119 +270,66 @@ def compute_matches(df_pairs: pd.DataFrame, max_dist: int) -> pd.DataFrame:
             "CustomerNumber": row["CustomerNumber"],
             "AccountId": row["AccountId"],
             "Spectrum_Customer_Code__c": row.get("SpectrumCode"),
-            "BuildOpsName": bi_name_raw,
-            "SalesforceName": sf_name_raw,
-            "BuildOpsEmail": row["BIEmail"],
-            "SalesforceEmail": row["SFEmail"],
-            "BuildOpsCity": row["BICity"],
-            "SalesforceCityBilling": row["SFBillingCity"],
-            "SalesforceCityShipping": row["SFShippingCity"],
-            "BuildOpsState": row["BIState"],
-            "SalesforceStateBilling": row["SFBillingState"],
-            "SalesforceStateShipping": row["SFShippingState"],
             "Dist": dist,
             "EmailScore": email_score,
+            "PhoneScore": phone_score,
+            "ZipScore": zip_score,
             "AddressCityScore": city_score,
             "StateScore": state_score,
-            "TotalScore": total_score
+            "MultiSignalBonus": multi_signal_bonus,
+            "TotalScore": total_score,
+            "ConfidenceBand": confidence
         })
 
     df = pd.DataFrame(results)
-    if df.empty:
-        return df
-
-    df["BestMatchFlag"] = df.groupby("CustomerId")["TotalScore"].transform(
-        lambda s: (s == s.min()).astype(int)
-    )
-
+    if not df.empty:
+        df["BestMatchFlag"] = df.groupby("CustomerId")["TotalScore"].transform(
+            lambda s: (s == s.min()).astype(int)
+        )
     return df
 
-
 ######################################################################
-# INSERT RESULTS (UNCHANGED)
+# INSERT
 ######################################################################
 
-def insert_results(engine, df_results: pd.DataFrame) -> int:
-    if df_results.empty:
-        return 0
-
+def insert_results(engine, df: pd.DataFrame) -> int:
     cols = [
         "CompanyCode",
+        "SourceSystem",
         "CustomerId",
         "CustomerNumber",
         "AccountId",
         "Spectrum_Customer_Code__c",
-        "BuildOpsName",
-        "SalesforceName",
-        "BuildOpsEmail",
-        "SalesforceEmail",
-        "BuildOpsCity",
-        "SalesforceCityBilling",
-        "SalesforceCityShipping",
-        "BuildOpsState",
-        "SalesforceStateBilling",
-        "SalesforceStateShipping",
         "Dist",
         "EmailScore",
+        "PhoneScore",
+        "ZipScore",
         "AddressCityScore",
         "StateScore",
+        "MultiSignalBonus",
         "TotalScore",
+        "ConfidenceBand",
         "BestMatchFlag"
     ]
-
-    df_results[cols].to_sql(
-        "ResultsBI",
-        engine,
-        if_exists="append",
-        index=False
-    )
-
-    return len(df_results)
-
+    df[cols].to_sql("ResultsBI", engine, if_exists="append", index=False)
+    return len(df)
 
 ######################################################################
-# MAIN PIPELINE (PATCHED)
+# MAIN
 ######################################################################
 
-def run_pipeline(
-    engine,
-    company_code: str,
-    max_dist: int,
-    source_system: str = "BUILDOPS",
-    batch_scores: bool = True,
-    final_scores: bool = False
-):
-    print(f"[{timestamp()}] Loading Salesforce accounts for {company_code}")
+def run_pipeline(engine, company_code: str, max_dist: int, source_system="BUILDOPS"):
     df_sf = load_sf_accounts(engine, company_code)
-    print(f"[{timestamp()}] Loaded {len(df_sf)} Salesforce accounts")
+    df_bi = load_spectrum_customers(engine, company_code) if source_system == "SPECTRUM" else load_bi_customers(engine, company_code)
 
-    if source_system == "SPECTRUM":
-        print(f"[{timestamp()}] Loading Spectrum customers for {company_code}")
-        df_bi = load_spectrum_customers(engine, company_code)
-    else:
-        print(f"[{timestamp()}] Loading BI customers for {company_code}")
-        df_bi = load_bi_customers(engine, company_code)
-
-    print(f"[{timestamp()}] Loaded {len(df_bi)} customers")
-
-    print(f"[{timestamp()}] Blocking candidate pairs...")
     df_pairs = block_pairs(df_sf, df_bi)
-    print(f"[{timestamp()}] Generated {len(df_pairs)} candidate pairs")
-
     if df_pairs.empty:
-        print(f"[{timestamp()}] No candidate pairs for {company_code}, skipping.")
         return
 
     df_pairs["CompanyCode"] = company_code
-
-    print(f"[{timestamp()}] Computing matches (max_dist={max_dist})...")
-    df_results = compute_matches(df_pairs, max_dist=max_dist)
-    print(f"[{timestamp()}] Produced {len(df_results)} scored matches")
-
+    df_results = compute_matches(df_pairs, max_dist)
     if df_results.empty:
         return
-    #ag source system
+
     df_results["SourceSystem"] = source_system
-    print(f"[{timestamp()}] Inserting results into ResultsBI...")
-    inserted = insert_results(engine, df_results)
-    print(f"[{timestamp()}] Inserted {inserted} rows into ResultsBI for {company_code}")
+    insert_results(engine, df_results)
