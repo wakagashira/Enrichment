@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 # Load .env file
 load_dotenv()
 
+#Set normalizer version
+NORMALIZER_VERSION = os.getenv("NORMALIZER_VERSION", "v1")
+
 # SQL credentials
 SQL_SERVER = os.getenv("SQL_SERVER")
 SQL_DATABASE = os.getenv("SQL_DATABASE")

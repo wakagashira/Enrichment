@@ -1,6 +1,13 @@
 import pandas as pd
 from sqlalchemy import create_engine, text
-from matcher import compute_distance, normalize
+
+from matcher import (
+    compute_distance,
+    normalize,
+    fuzzy_similarity_score,
+    fuzzy_score_to_dist,
+)
+
 from utils import timestamp
 
 ######################################################################
@@ -30,7 +37,7 @@ def normalize_state(s: str) -> str:
     return US_STATE_MAP.get(s.lower(), "")
 
 ######################################################################
-# NORMALIZATION HELPERS
+# HELPERS
 ######################################################################
 
 def normalize_phone(p):
@@ -84,21 +91,42 @@ def load_sf_accounts(engine, company_code: str) -> pd.DataFrame:
     return pd.read_sql(text(query), engine, params={"cc": company_code})
 
 
-def load_bi_customers(engine, company_code: str) -> pd.DataFrame:
+def load_buildops_customers(engine, company_code: str) -> pd.DataFrame:
+    """
+    BUILDOPS customer loader.
+    CompanyCode = first 3 chars of accountingRefId
+    CustomerNumber = substring after '/' in accountingRefId
+    """
     query = """
         SELECT
             id AS CustomerId,
-            Customer_Code AS CustomerNumber,
-            Name,
-            Customer_Email,
-            Phone,
-            City,
-            State,
-            Zip
-        FROM dbo.Master_Customer_From_BI
-        WHERE Company_Code = :cc;
+
+            -- Everything after the slash
+            CASE
+                WHEN CHARINDEX('/', accountingRefId) > 0
+                THEN SUBSTRING(
+                    accountingRefId,
+                    CHARINDEX('/', accountingRefId) + 1,
+                    LEN(accountingRefId)
+                )
+                ELSE NULL
+            END AS CustomerNumber,
+
+            name AS Name,
+            email AS Customer_Email,
+            COALESCE(phonePrimary, phoneAlternate) AS Phone,
+            address0_city AS City,
+            address0_state AS State,
+            address0_zipcode AS Zip
+
+        FROM BuildOps.dbo.Customers
+        WHERE
+            accountingRefId IS NOT NULL
+            AND LEFT(accountingRefId, 3) = :cc
+            AND isActive = 1;
     """
     return pd.read_sql(text(query), engine, params={"cc": company_code})
+
 
 
 def load_spectrum_customers(engine, company_code: str) -> pd.DataFrame:
@@ -118,12 +146,23 @@ def load_spectrum_customers(engine, company_code: str) -> pd.DataFrame:
     """
     return pd.read_sql(text(query), engine, params={"cc": company_code})
 
+
+def load_all_company_codes(engine):
+    query = """
+        SELECT DISTINCT Company_Code__c
+        FROM salesforce.creteProd.Partner__c
+        WHERE Company_Code__c IS NOT NULL
+        ORDER BY Company_Code__c;
+    """
+    df = pd.read_sql(text(query), engine)
+    return df["Company_Code__c"].dropna().tolist()
+
 ######################################################################
 # BLOCKING
 ######################################################################
 
-def block_pairs(df_sf: pd.DataFrame, df_bi: pd.DataFrame) -> pd.DataFrame:
-    if df_sf.empty or df_bi.empty:
+def block_pairs(df_sf: pd.DataFrame, df_src: pd.DataFrame) -> pd.DataFrame:
+    if df_sf.empty or df_src.empty:
         return pd.DataFrame()
 
     df_sf = df_sf.rename(columns={
@@ -140,7 +179,7 @@ def block_pairs(df_sf: pd.DataFrame, df_bi: pd.DataFrame) -> pd.DataFrame:
         "Spectrum_Customer_Code__c": "SpectrumCode"
     })
 
-    df_bi = df_bi.rename(columns={
+    df_src = df_src.rename(columns={
         "CustomerId": "CustomerId",
         "CustomerNumber": "CustomerNumber",
         "Name": "BIName",
@@ -152,32 +191,16 @@ def block_pairs(df_sf: pd.DataFrame, df_bi: pd.DataFrame) -> pd.DataFrame:
     })
 
     df_sf["FirstChar"] = df_sf["SFName"].str[0].str.upper()
-    df_bi["FirstChar"] = df_bi["BIName"].str[0].str.upper()
+    df_src["FirstChar"] = df_src["BIName"].str[0].str.upper()
 
     df_sf["NameLen_sf"] = df_sf["SFName"].str.len()
-    df_bi["NameLen_bi"] = df_bi["BIName"].str.len()
+    df_src["NameLen_bi"] = df_src["BIName"].str.len()
 
-    merged = df_bi.merge(df_sf, on="FirstChar", how="inner")
+    merged = df_src.merge(df_sf, on="FirstChar", how="inner")
     return merged[(merged["NameLen_bi"] - merged["NameLen_sf"]).abs() <= 3]
-######################################################################
-# LOAD ALL COMPANY CODES (USED WHEN COMPANY_CODE = ALL)
-######################################################################
 
-def load_all_company_codes(engine):
-    """
-    Load all distinct Company_Code__c values from Salesforce Partner__c.
-    Used by spectrumrank.py when COMPANY_CODE=ALL.
-    """
-    query = """
-        SELECT DISTINCT Company_Code__c
-        FROM salesforce.creteProd.Partner__c
-        WHERE Company_Code__c IS NOT NULL
-        ORDER BY Company_Code__c;
-    """
-    df = pd.read_sql(text(query), engine)
-    return df["Company_Code__c"].dropna().tolist()
 ######################################################################
-# SCORING + BONUS + CONFIDENCE
+# MATCHING
 ######################################################################
 
 def compute_matches(df_pairs: pd.DataFrame, max_dist: int) -> pd.DataFrame:
@@ -187,82 +210,18 @@ def compute_matches(df_pairs: pd.DataFrame, max_dist: int) -> pd.DataFrame:
         bi_norm = normalize(row["BIName"] or "")
         sf_norm = normalize(row["SFName"] or "")
 
-        min_len = min(len(bi_norm), len(sf_norm))
-        if min_len == 0:
+        if not bi_norm or not sf_norm:
             continue
-        elif min_len < 4:
-            dist = 0 if bi_norm == sf_norm else max(4, max_dist)
-        else:
-            dist = compute_distance(bi_norm, sf_norm)
 
+        legacy_dist = compute_distance(bi_norm, sf_norm)
+        fuzzy_dist = fuzzy_score_to_dist(
+            fuzzy_similarity_score(bi_norm, sf_norm),
+            max_dist=max_dist
+        )
+
+        dist = min(legacy_dist, fuzzy_dist)
         if dist > max_dist:
             continue
-
-        # Email
-        email_score = 0
-        bi_email = (row["BIEmail"] or "").lower().strip()
-        sf_email = (row["SFEmail"] or "").lower().strip()
-        if bi_email and sf_email:
-            if bi_email == sf_email:
-                email_score = -1
-            elif email_domain(bi_email) == email_domain(sf_email):
-                email_score = -1
-
-        # Phone
-        phone_score = -2 if normalize_phone(row.get("BIPhone")) == normalize_phone(row.get("SFPhone")) and normalize_phone(row.get("BIPhone")) else 0
-
-        # City
-        bi_city = (row.get("BICity") or "").lower().strip()
-        sf_cities = [(row.get("SFBillingCity") or "").lower().strip(),
-                     (row.get("SFShippingCity") or "").lower().strip()]
-        sf_cities = [c for c in sf_cities if c]
-
-        if bi_city and bi_city in sf_cities:
-            city_score = -1
-        elif bi_city and sf_cities:
-            city_score = 1
-        else:
-            city_score = 0
-
-        # ZIP
-        zip_score = -1 if normalize_zip(row.get("BIZip")) in [
-            normalize_zip(row.get("SFBillingPostalCode")),
-            normalize_zip(row.get("SFShippingPostalCode"))
-        ] and normalize_zip(row.get("BIZip")) else 0
-
-        # State
-        bi_state = normalize_state(row.get("BIState"))
-        sf_states = [normalize_state(row.get("SFBillingState")),
-                     normalize_state(row.get("SFShippingState"))]
-        sf_states = [s for s in sf_states if s]
-
-        if bi_state and bi_state in sf_states:
-            state_score = -1
-        elif bi_state and sf_states:
-            state_score = 1
-        else:
-            state_score = 0
-
-        # Multi-signal bonus
-        strong_signals = sum([
-            dist <= 1,
-            email_score < 0,
-            phone_score < 0,
-            zip_score < 0,
-            city_score < 0,
-            state_score < 0
-        ])
-        multi_signal_bonus = -1 if strong_signals >= 3 else 0
-
-        total_score = dist + email_score + phone_score + zip_score + city_score + state_score + multi_signal_bonus
-
-        # Confidence band
-        if total_score <= 0:
-            confidence = "HIGH"
-        elif total_score <= 2:
-            confidence = "MEDIUM"
-        else:
-            confidence = "LOW"
 
         results.append({
             "CompanyCode": row["CompanyCode"],
@@ -271,14 +230,8 @@ def compute_matches(df_pairs: pd.DataFrame, max_dist: int) -> pd.DataFrame:
             "AccountId": row["AccountId"],
             "Spectrum_Customer_Code__c": row.get("SpectrumCode"),
             "Dist": dist,
-            "EmailScore": email_score,
-            "PhoneScore": phone_score,
-            "ZipScore": zip_score,
-            "AddressCityScore": city_score,
-            "StateScore": state_score,
-            "MultiSignalBonus": multi_signal_bonus,
-            "TotalScore": total_score,
-            "ConfidenceBand": confidence
+            "TotalScore": dist,
+            "ConfidenceBand": "HIGH" if dist == 0 else "MEDIUM"
         })
 
     df = pd.DataFrame(results)
@@ -293,36 +246,31 @@ def compute_matches(df_pairs: pd.DataFrame, max_dist: int) -> pd.DataFrame:
 ######################################################################
 
 def insert_results(engine, df: pd.DataFrame) -> int:
-    cols = [
-        "CompanyCode",
-        "SourceSystem",
-        "CustomerId",
-        "CustomerNumber",
-        "AccountId",
-        "Spectrum_Customer_Code__c",
-        "Dist",
-        "EmailScore",
-        "PhoneScore",
-        "ZipScore",
-        "AddressCityScore",
-        "StateScore",
-        "MultiSignalBonus",
-        "TotalScore",
-        "ConfidenceBand",
-        "BestMatchFlag"
-    ]
-    df[cols].to_sql("ResultsBI", engine, if_exists="append", index=False)
+    df.to_sql("ResultsBI", engine, if_exists="append", index=False)
     return len(df)
 
 ######################################################################
 # MAIN
 ######################################################################
 
-def run_pipeline(engine, company_code: str, max_dist: int, source_system="BUILDOPS"):
+def run_pipeline(
+    engine,
+    company_code: str,
+    max_dist: int,
+    source_system="BUILDOPS",
+    batch_scores=False,
+    final_scores=False,
+):
     df_sf = load_sf_accounts(engine, company_code)
-    df_bi = load_spectrum_customers(engine, company_code) if source_system == "SPECTRUM" else load_bi_customers(engine, company_code)
 
-    df_pairs = block_pairs(df_sf, df_bi)
+    if source_system == "SPECTRUM":
+        df_src = load_spectrum_customers(engine, company_code)
+    elif source_system == "BUILDOPS":
+        df_src = load_buildops_customers(engine, company_code)
+    else:
+        raise ValueError(f"Unsupported source_system: {source_system}")
+
+    df_pairs = block_pairs(df_sf, df_src)
     if df_pairs.empty:
         return
 
